@@ -90,6 +90,11 @@ async function encodeSlideshow(
     if (!fallback.supported) {
       throw new Error('H.264 encoding is not supported on this device.')
     }
+    // Use the validated config from the fallback check
+    codecConfig = fallback.config!
+  } else {
+    // Use the validated config from the primary check
+    codecConfig = check.config!
   }
 
   const target = new ArrayBufferTarget()
