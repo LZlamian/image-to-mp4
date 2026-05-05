@@ -1,6 +1,5 @@
-import { useRef, useState, useCallback } from 'react'
-import { FFmpeg } from '@ffmpeg/ffmpeg'
-import { fetchFile, toBlobURL } from '@ffmpeg/util'
+import { useState, useCallback } from 'react'
+import { Muxer, ArrayBufferTarget } from 'mp4-muxer'
 
 export type ConvertMode = 'one-to-one' | 'many-to-one'
 
@@ -9,39 +8,26 @@ export interface ConversionResult {
   url: string
 }
 
-const CDN = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd'
+const MAX_SIDE = 1920 // cap longest dimension to 1080p-equivalent
 
 export function useConverter() {
-  const ffmpegRef = useRef<FFmpeg | null>(null)
-  const loadedRef = useRef(false)
-  const [loaded, setLoaded] = useState(false)
-  const [loading, setLoading] = useState(false)
   const [status, setStatus] = useState('')
   const [converting, setConverting] = useState(false)
 
-  const load = useCallback(async () => {
-    if (loadedRef.current) return
-    setLoading(true)
-    setStatus('Loading video engine (~31 MB, cached after first load)…')
-    const ffmpeg = new FFmpeg()
-    const [coreURL, wasmURL] = await Promise.all([
-      toBlobURL(`${CDN}/ffmpeg-core.js`, 'text/javascript'),
-      toBlobURL(`${CDN}/ffmpeg-core.wasm`, 'application/wasm'),
-    ])
-    await ffmpeg.load({ coreURL, wasmURL })
-    ffmpegRef.current = ffmpeg
-    loadedRef.current = true
-    setLoaded(true)
-    setLoading(false)
-    setStatus('')
-  }, [])
+  // No async loading needed — Web Codecs are built-in
+  const load = useCallback(async () => {}, [])
 
   const convert = useCallback(async (
     files: File[],
     mode: ConvertMode,
     duration: number,
   ): Promise<ConversionResult[]> => {
-    const ffmpeg = ffmpegRef.current!
+    if (!('VideoEncoder' in window)) {
+      throw new Error(
+        'Video encoding is not supported in this browser. Please use Chrome, Edge, or Safari 16.4+.',
+      )
+    }
+
     setConverting(true)
     const results: ConversionResult[] = []
 
@@ -50,63 +36,19 @@ export function useConverter() {
         for (let i = 0; i < files.length; i++) {
           setStatus(`Converting image ${i + 1} of ${files.length}…`)
           const normalized = await normalizeToJpeg(files[i])
-          const inputName = `img${i}.jpg`
-          const outputName = `out${i}.mp4`
-
-          await ffmpeg.writeFile(inputName, await fetchFile(normalized))
-          await ffmpeg.exec([
-            '-loop', '1', '-i', inputName,
-            '-t', String(duration),
-            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast',
-            outputName,
-          ])
-
-          const data = await ffmpeg.readFile(outputName)
+          const blob = await encodeSlideshow([normalized], duration)
           results.push({
             name: stem(files[i].name) + '.mp4',
-            url: URL.createObjectURL(new Blob([data as unknown as BlobPart], { type: 'video/mp4' })),
+            url: URL.createObjectURL(blob),
           })
-          await ffmpeg.deleteFile(inputName)
-          await ffmpeg.deleteFile(outputName)
         }
       } else {
         setStatus('Building slideshow…')
         const normalized = await Promise.all(files.map(normalizeToJpeg))
-
-        // Detect output dimensions from the first image
-        const [outW, outH] = await getOutputDimensions(normalized[0])
-        const vf = [
-          `scale=${outW}:${outH}:force_original_aspect_ratio=decrease`,
-          `pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2:black`,
-        ].join(',')
-
-        const lines: string[] = []
-        for (let i = 0; i < normalized.length; i++) {
-          const name = `img${i}.jpg`
-          await ffmpeg.writeFile(name, await fetchFile(normalized[i]))
-          lines.push(`file '${name}'`, `duration ${duration}`)
-        }
-        // Concat demuxer requires the last file repeated without a duration
-        lines.push(`file 'img${normalized.length - 1}.jpg'`)
-        await ffmpeg.writeFile('list.txt', lines.join('\n'))
-
-        await ffmpeg.exec([
-          '-f', 'concat', '-safe', '0', '-i', 'list.txt',
-          '-vf', vf,
-          '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast',
-          'out.mp4',
-        ])
-
-        const data = await ffmpeg.readFile('out.mp4')
-        results.push({
-          name: 'slideshow.mp4',
-          url: URL.createObjectURL(new Blob([data as unknown as BlobPart], { type: 'video/mp4' })),
+        const blob = await encodeSlideshow(normalized, duration, (i) => {
+          setStatus(`Encoding image ${i + 1} of ${normalized.length}…`)
         })
-
-        for (let i = 0; i < normalized.length; i++) await ffmpeg.deleteFile(`img${i}.jpg`)
-        await ffmpeg.deleteFile('list.txt')
-        await ffmpeg.deleteFile('out.mp4')
+        results.push({ name: 'slideshow.mp4', url: URL.createObjectURL(blob) })
       }
     } finally {
       setConverting(false)
@@ -116,7 +58,104 @@ export function useConverter() {
     return results
   }, [])
 
-  return { load, loaded, loading, status, converting, convert }
+  return { load, loaded: true, loading: false, status, converting, convert }
+}
+
+async function encodeSlideshow(
+  files: File[],
+  duration: number,
+  onProgress?: (imageIndex: number) => void,
+): Promise<Blob> {
+  const images = await Promise.all(files.map(loadImage))
+
+  // Determine output size, capped at MAX_SIDE, even dimensions required by H.264
+  const rawW = Math.max(...images.map(img => img.naturalWidth))
+  const rawH = Math.max(...images.map(img => img.naturalHeight))
+  const scale = Math.min(1, MAX_SIDE / Math.max(rawW, rawH))
+  const w = Math.ceil(rawW * scale / 2) * 2
+  const h = Math.ceil(rawH * scale / 2) * 2
+
+  // Prefer Main Profile; fall back to Baseline
+  let codecConfig: VideoEncoderConfig = {
+    codec: 'avc1.4D0028', // H.264 Main Profile Level 4.0
+    width: w,
+    height: h,
+    framerate: 30,
+    bitrate: 2_000_000,
+  }
+  const check = await VideoEncoder.isConfigSupported(codecConfig)
+  if (!check.supported) {
+    codecConfig = { ...codecConfig, codec: 'avc1.42001F' } // Baseline Level 3.1
+    const fallback = await VideoEncoder.isConfigSupported(codecConfig)
+    if (!fallback.supported) {
+      throw new Error('H.264 encoding is not supported on this device.')
+    }
+  }
+
+  const target = new ArrayBufferTarget()
+  const muxer = new Muxer({
+    target,
+    video: { codec: 'avc', width: w, height: h },
+    fastStart: 'in-memory',
+  })
+
+  let encoderError: Error | null = null
+  const encoder = new VideoEncoder({
+    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+    error: (e) => { encoderError = e },
+  })
+  encoder.configure(codecConfig)
+
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')!
+
+  const fps = 30
+  const frameDuration = 1_000_000 / fps // microseconds per frame
+  let timestamp = 0
+
+  for (let imgIdx = 0; imgIdx < images.length; imgIdx++) {
+    onProgress?.(imgIdx)
+    if (encoderError) throw encoderError
+
+    const img = images[imgIdx]
+    ctx.fillStyle = '#000'
+    ctx.fillRect(0, 0, w, h)
+    const s = Math.min(w / img.naturalWidth, h / img.naturalHeight)
+    const iw = Math.round(img.naturalWidth * s)
+    const ih = Math.round(img.naturalHeight * s)
+    ctx.drawImage(img, Math.round((w - iw) / 2), Math.round((h - ih) / 2), iw, ih)
+
+    const frameCount = Math.round(duration * fps)
+    for (let f = 0; f < frameCount; f++) {
+      if (encoderError) throw encoderError
+      // Apply backpressure if encoder is saturated
+      while (encoder.encodeQueueSize > 30) {
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      const frame = new VideoFrame(canvas, { timestamp })
+      encoder.encode(frame, { keyFrame: f === 0 })
+      frame.close()
+      timestamp += frameDuration
+    }
+  }
+
+  await encoder.flush()
+  if (encoderError) throw encoderError
+  muxer.finalize()
+
+  return new Blob([target.buffer], { type: 'video/mp4' })
+}
+
+function loadImage(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const img = new Image()
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img) }
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error(`Failed to load: ${file.name}`)) }
+    img.src = url
+  })
 }
 
 async function normalizeToJpeg(file: File): Promise<File> {
@@ -130,22 +169,6 @@ async function normalizeToJpeg(file: File): Promise<File> {
     return new File([blob], stem(file.name) + '.jpg', { type: 'image/jpeg' })
   }
   return file
-}
-
-async function getOutputDimensions(file: File): Promise<[number, number]> {
-  return new Promise(resolve => {
-    const url = URL.createObjectURL(file)
-    const img = new Image()
-    img.onload = () => {
-      // Ensure even dimensions (H.264 requirement)
-      const w = Math.ceil(img.naturalWidth / 2) * 2
-      const h = Math.ceil(img.naturalHeight / 2) * 2
-      URL.revokeObjectURL(url)
-      resolve([w, h])
-    }
-    img.onerror = () => { URL.revokeObjectURL(url); resolve([1920, 1080]) }
-    img.src = url
-  })
 }
 
 function stem(filename: string): string {

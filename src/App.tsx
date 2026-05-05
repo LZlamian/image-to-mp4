@@ -197,7 +197,7 @@ export default function App() {
       </main>
 
       <footer>
-        <p>Powered by <a href="https://github.com/ffmpegwasm/ffmpeg.wasm" target="_blank" rel="noopener noreferrer">ffmpeg.wasm</a></p>
+        <p>Powered by <a href="https://developer.mozilla.org/en-US/docs/Web/API/VideoEncoder" target="_blank" rel="noopener noreferrer">Web Codecs API</a> — no uploads, runs locally</p>
       </footer>
     </div>
   )

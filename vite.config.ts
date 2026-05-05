@@ -23,22 +23,7 @@ export default defineConfig({
       },
       workbox: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
-        maximumFileSizeToCacheInBytes: 35 * 1024 * 1024,
-        runtimeCaching: [
-          {
-            urlPattern: /unpkg\.com.*@ffmpeg/,
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'ffmpeg-core',
-              expiration: { maxEntries: 5, maxAgeSeconds: 30 * 24 * 60 * 60 },
-              cacheableResponse: { statuses: [0, 200] },
-            },
-          },
-        ],
       },
     }),
   ],
-  optimizeDeps: {
-    exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
-  },
 })
