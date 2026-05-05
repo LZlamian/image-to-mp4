@@ -92,6 +92,9 @@ async function encodeSlideshow(
     }
   }
 
+  const fps = 30
+  const frameDuration = Math.round(1_000_000 / fps) // microseconds per frame
+
   const target = new ArrayBufferTarget()
   const muxer = new Muxer({
     target,
@@ -101,7 +104,13 @@ async function encodeSlideshow(
 
   let encoderError: Error | null = null
   const encoder = new VideoEncoder({
-    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+    output: (chunk, meta) => {
+      // chunk.duration is often null from VideoEncoder; addVideoChunkRaw requires
+      // a non-negative number, so we always supply the explicit frame duration.
+      const buf = new Uint8Array(chunk.byteLength)
+      chunk.copyTo(buf)
+      muxer.addVideoChunkRaw(buf, chunk.type, chunk.timestamp, chunk.duration ?? frameDuration, meta ?? undefined)
+    },
     error: (e) => { encoderError = e },
   })
   encoder.configure(codecConfig)
@@ -110,9 +119,6 @@ async function encodeSlideshow(
   canvas.width = w
   canvas.height = h
   const ctx = canvas.getContext('2d')!
-
-  const fps = 30
-  const frameDuration = 1_000_000 / fps // microseconds per frame
   let timestamp = 0
 
   for (let imgIdx = 0; imgIdx < images.length; imgIdx++) {
